@@ -3,7 +3,10 @@ import numpy as np
 import os
 import pickle
 import argparse
+import h5py
 import matplotlib.pyplot as plt
+import warnings
+import time
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
@@ -21,8 +24,77 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+
+TIAGO_STATE_DIM = 12
+
+
+def resolve_device(device_arg='auto'):
+    if isinstance(device_arg, torch.device):
+        return device_arg
+
+    device_arg = str(device_arg).lower()
+    if device_arg not in ('auto', 'cuda', 'cpu'):
+        raise ValueError(f'Unsupported device: {device_arg}. Use one of: auto/cuda/cpu.')
+
+    if device_arg in ('auto', 'cuda'):
+        try:
+            # Trigger a minimal CUDA allocation to verify runtime availability.
+            torch.empty(1, device='cuda')
+            return torch.device('cuda')
+        except Exception as exc:
+            msg = f'CUDA unavailable ({type(exc).__name__}: {exc}). Falling back to CPU.'
+            warnings.warn(msg, RuntimeWarning)
+            if device_arg == 'cuda':
+                print(f'[device] {msg}')
+    return torch.device('cpu')
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f'{hours:02d}:{minutes:02d}:{secs:02d}'
+
+
+def infer_dataset_state_dim(dataset_dir, num_episodes, expected_state_dim=None):
+    """
+    Infer training state/action dimension from ACT-format episodes.
+    Uses the first available episode file and falls back to max(qpos_dim, action_dim)
+    when dimensions differ.
+    """
+    expected = None if expected_state_dim is None else int(expected_state_dim)
+    for episode_id in range(num_episodes):
+        dataset_path = os.path.join(dataset_dir, f'episode_{episode_id}.hdf5')
+        if not os.path.isfile(dataset_path):
+            continue
+        with h5py.File(dataset_path, 'r') as root:
+            if '/observations/qpos' not in root or '/action' not in root:
+                continue
+            qpos_dim = int(root['/observations/qpos'].shape[-1])
+            action_dim = int(root['/action'].shape[-1])
+            if qpos_dim != action_dim:
+                raise RuntimeError(
+                    f'Dataset dimension mismatch in {dataset_path}: '
+                    f'qpos_dim={qpos_dim}, action_dim={action_dim}. '
+                    'Please regenerate data with unified dimensions.'
+                )
+            inferred = qpos_dim
+            if expected is not None and inferred != expected:
+                raise RuntimeError(
+                    f'Dataset state_dim mismatch in {dataset_path}: '
+                    f'found={inferred}, expected={expected}.'
+                )
+            return inferred
+    raise RuntimeError(
+        f'Failed to infer state_dim from dataset_dir={dataset_dir}. '
+        f'Please ensure episode_*.hdf5 contains /observations/qpos and /action.'
+    )
+
+
 def main(args):
     set_seed(1)
+    device = resolve_device(args['device'])
+    print(f'[device] Using device: {device}')
     # command line parameters
     is_eval = args['eval']
     ckpt_dir = args['ckpt_dir']
@@ -32,6 +104,7 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+    num_workers = args['num_workers']
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -46,8 +119,10 @@ def main(args):
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
-    # fixed parameters
-    state_dim = 14
+    # fixed/model parameters
+    expected_state_dim = int(args.get('state_dim', TIAGO_STATE_DIM))
+    state_dim = infer_dataset_state_dim(dataset_dir, num_episodes, expected_state_dim=expected_state_dim)
+    print(f'[data] Inferred state/action dim: {state_dim}')
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -64,11 +139,13 @@ def main(args):
                          'enc_layers': enc_layers,
                          'dec_layers': dec_layers,
                          'nheads': nheads,
-                         'camera_names': camera_names,
+                         'state_dim': state_dim,
+                          'camera_names': camera_names,
+                         'device': str(device),
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,}
+                         'camera_names': camera_names, 'device': str(device), 'state_dim': state_dim}
     else:
         raise NotImplementedError
 
@@ -85,7 +162,8 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'device': device
     }
 
     if is_eval:
@@ -100,7 +178,15 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir,
+        num_episodes,
+        camera_names,
+        batch_size_train,
+        batch_size_val,
+        num_workers=num_workers,
+        pin_memory=(device.type == 'cuda'),
+    )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -138,18 +224,19 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
-def get_image(ts, camera_names):
+def get_image(ts, camera_names, device):
     curr_images = []
     for cam_name in camera_names:
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
     return curr_image
 
 
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(1000)
+    device = config['device']
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     real_robot = config['real_robot']
@@ -165,22 +252,32 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
     print(loading_status)
-    policy.cuda()
+    policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
+    stats_qpos_dim = int(np.asarray(stats['qpos_mean']).shape[0])
+    stats_action_dim = int(np.asarray(stats['action_mean']).shape[0])
+    if stats_qpos_dim != stats_action_dim:
+        raise RuntimeError(
+            f'dataset_stats dimension mismatch: qpos_dim={stats_qpos_dim}, action_dim={stats_action_dim}.'
+        )
+    if stats_action_dim != state_dim:
+        raise RuntimeError(
+            f'Config state_dim ({state_dim}) != dataset_stats dim ({stats_action_dim}).'
+        )
 
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
     # load environment
     if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
-        from aloha_scripts.real_env import make_real_env # requires aloha
+        from aloha_scripts.robot_utils import move_grippers # type: ignore # requires aloha
+        from aloha_scripts.real_env import make_real_env # type: ignore # requires aloha
         env = make_real_env(init_node=True)
         env_max_reward = 0
     else:
@@ -216,9 +313,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim], device=device)
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+        qpos_history = torch.zeros((1, max_timesteps, state_dim), device=device)
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -239,9 +336,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                curr_image = get_image(ts, camera_names, device)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -255,7 +352,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                        exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -313,9 +410,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy):
+def forward_pass(data, policy, device):
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    image_data = image_data.to(device, non_blocking=True)
+    qpos_data = qpos_data.to(device, non_blocking=True)
+    action_data = action_data.to(device, non_blocking=True)
+    is_pad = is_pad.to(device, non_blocking=True)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -325,25 +425,28 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    device = config['device']
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.cuda()
+    policy.to(device)
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    for epoch in tqdm(range(num_epochs)):
+    overall_start_time = time.time()
+    epoch_pbar = tqdm(range(num_epochs), total=num_epochs, dynamic_ncols=True, leave=True)
+    for epoch in epoch_pbar:
         print(f'\nEpoch {epoch}')
         # validation
         with torch.inference_mode():
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy)
+                forward_dict = forward_pass(data, policy, device)
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
@@ -362,7 +465,7 @@ def train_bc(train_dataloader, val_dataloader, config):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
+            forward_dict = forward_pass(data, policy, device)
             # backward
             loss = forward_dict['loss']
             loss.backward()
@@ -376,6 +479,24 @@ def train_bc(train_dataloader, val_dataloader, config):
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
+
+        elapsed = time.time() - overall_start_time
+        finished_epochs = epoch + 1
+        avg_sec_per_epoch = elapsed / max(1, finished_epochs)
+        eta = avg_sec_per_epoch * max(0, num_epochs - finished_epochs)
+        progress_msg = (
+            f'[progress] {finished_epochs}/{num_epochs} | '
+            f'elapsed {format_duration(elapsed)} | '
+            f'eta {format_duration(eta)} | '
+            f'avg {avg_sec_per_epoch:.2f}s/epoch'
+        )
+        tqdm.write(progress_msg)
+        epoch_pbar.set_description(f'Epoch {finished_epochs}/{num_epochs}')
+        epoch_pbar.set_postfix(
+            val=f'{epoch_val_loss:.3f}',
+            train=f'{epoch_train_loss:.3f}',
+            eta=format_duration(eta),
+        )
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
@@ -395,6 +516,7 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     return best_ckpt_info
 
+    device = config['device']
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
     # save training curves
@@ -424,6 +546,12 @@ if __name__ == '__main__':
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    parser.add_argument('--num_workers', action='store', type=int, default=0,
+                        help='DataLoader workers. Use 0 for restricted/sandboxed environments.')
+    parser.add_argument('--device', action='store', type=str, default='auto', choices=['auto', 'cuda', 'cpu'],
+                        help='Training device. auto tries CUDA then CPU fallback.')
+    parser.add_argument('--state_dim', action='store', type=int, default=TIAGO_STATE_DIM,
+                        help='Expected unified qpos/action dimension. Default is 12 for Tiago.')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

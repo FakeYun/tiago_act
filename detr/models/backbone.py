@@ -7,6 +7,7 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 import torchvision
+import warnings
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
@@ -89,9 +90,35 @@ class Backbone(BackboneBase):
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool):
-        backbone = getattr(torchvision.models, name)(
+        builder = getattr(torchvision.models, name)
+        model_kwargs = dict(
             replace_stride_with_dilation=[False, False, dilation],
-            pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
+            norm_layer=FrozenBatchNorm2d,
+        )
+
+        # Try pretrained weights first; if downloading fails (offline/SSL/proxy),
+        # fall back to random init so training can still start.
+        if is_main_process():
+            try:
+                backbone = builder(weights="DEFAULT", **model_kwargs)
+            except TypeError:
+                # Backward compatibility with older torchvision API.
+                backbone = builder(pretrained=True, **model_kwargs)
+            except Exception as exc:
+                warnings.warn(
+                    f"Pretrained backbone load failed ({type(exc).__name__}: {exc}). "
+                    "Falling back to randomly initialized backbone.",
+                    RuntimeWarning,
+                )
+                try:
+                    backbone = builder(weights=None, **model_kwargs)
+                except TypeError:
+                    backbone = builder(pretrained=False, **model_kwargs)
+        else:
+            try:
+                backbone = builder(weights=None, **model_kwargs)
+            except TypeError:
+                backbone = builder(pretrained=False, **model_kwargs)
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 

@@ -9,6 +9,18 @@ from .models import build_ACT_model, build_CNNMLP_model
 import IPython
 e = IPython.embed
 
+
+def _resolve_torch_device(device_arg='auto'):
+    if isinstance(device_arg, torch.device):
+        return device_arg
+    device_arg = str(device_arg).lower()
+    if device_arg == 'cpu':
+        return torch.device('cpu')
+    if device_arg == 'cuda':
+        return torch.device('cuda')
+    # auto
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float) # will be overridden
@@ -63,6 +75,8 @@ def get_args_parser():
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--device', action='store', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
+    parser.add_argument('--num_workers', action='store', type=int, default=0)
 
     return parser
 
@@ -74,8 +88,9 @@ def build_ACT_model_and_optimizer(args_override):
     for k, v in args_override.items():
         setattr(args, k, v)
 
+    device = _resolve_torch_device(getattr(args, 'device', 'auto'))
     model = build_ACT_model(args)
-    model.cuda()
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -97,8 +112,9 @@ def build_CNNMLP_model_and_optimizer(args_override):
     for k, v in args_override.items():
         setattr(args, k, v)
 
+    device = _resolve_torch_device(getattr(args, 'device', 'auto'))
     model = build_CNNMLP_model(args)
-    model.cuda()
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -111,4 +127,3 @@ def build_CNNMLP_model_and_optimizer(args_override):
                                   weight_decay=args.weight_decay)
 
     return model, optimizer
-

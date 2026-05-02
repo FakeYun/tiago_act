@@ -71,6 +71,18 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
+ckpt/
+checkpoints/
+
+*.ckpt
+*.pt
+*.pth
+*.hdf5
+*.h5
+*.bag
+*.pkl
+*.npy
+*.npz
 # Translations
 *.mo
 *.pot

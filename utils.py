@@ -108,8 +108,11 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_workers=0, pin_memory=None):
     print(f'\nData from: {dataset_dir}\n')
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
     # obtain train test split
     train_ratio = 0.8
     shuffled_indices = np.random.permutation(num_episodes)
@@ -122,8 +125,26 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats)
     val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
+
+    train_loader_kwargs = dict(
+        batch_size=batch_size_train,
+        shuffle=True,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+    val_loader_kwargs = dict(
+        batch_size=batch_size_val,
+        shuffle=True,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+
+    if num_workers > 0:
+        train_loader_kwargs['prefetch_factor'] = 1
+        val_loader_kwargs['prefetch_factor'] = 1
+
+    train_dataloader = DataLoader(train_dataset, **train_loader_kwargs)
+    val_dataloader = DataLoader(val_dataset, **val_loader_kwargs)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 
